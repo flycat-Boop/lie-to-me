@@ -1,3 +1,7 @@
+![PHP Version](https://img.shields.io/badge/PHP-8.0%2B-blue.svg)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
+![Status](https://img.shields.io/badge/Status-Active-success.svg)
+![Type](https://img.shields.io/badge/Type-Deception%20Honeypot-red.svg)
 # 🕵️‍♂️ Lie to Me - Deception Honeypot
 # 🕵️‍♂️ Lie to Me - 蓝队欺骗防御蜜罐
 
