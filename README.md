@@ -70,3 +70,22 @@ No complex configuration needed, just a PHP environment:
 ---
 *Disclaimer: This project is for Blue Team research, open-source education, and geek trolling only. Do NOT use it for any illegal purposes.*
 *免责声明：本项目仅供蓝队防御研究、开源教育与极客整活。请勿用于任何非法用途。*
+Release v1.2 - Deception & Defense Upgrade
+
+🚀 New Features:
+
+· Real IP Detection: Support CF-Connecting-IP and X-Forwarded-For to prevent CDN IP blocking. (穿透 CDN 获取真实 IP)
+· Log Rotation: Automatically rotate logs at 10MB and keep only the latest 5 .bak backups. (日志自动轮转与清理，防硬盘撑爆)
+· Scanner Silent Bypass: Detect common scanners (sqlmap, nmap, etc.) and silently pass them as normal requests to waste their time. (扫描器静默识别，反制自动化工具)
+· WAF Counter & Ban: Human attackers triggering SQLi/XSS twice will be permanently banned and unlock the "Hardcore Skid" achievement. (人类黑客两次注入封禁与嘲讽)
+
+🛡️ Bug Fixes:
+
+· Fixed the issue where WAF regex missed XSS payloads. (修复 WAF 正则遗漏 XSS 的问题)
+
+---
+
+🌟 Acknowledgments / 特别致谢
+
+· Special thanks to @盗号的全家si了 for the sharp Code Review, pointing out the CDN shared IP issue and the 50MB log truncation vulnerability. Your feedback made this project much stronger. (特别感谢群友 盗号的全家si了 的硬核 Code Review，精准指出了 CDN 回源 IP 和日志截断问题，让本项目更加完善。)
+· Thanks to all allies and developers who provided suggestions for this project. The best defense is built by the community. (感谢所有提出宝贵修改建议的同盟和大佬。最好的防御，由社区共同构建。)
