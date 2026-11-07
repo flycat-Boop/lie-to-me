@@ -5,19 +5,43 @@
 @ini_set('display_errors', 0);
 ignore_user_abort(true);
 
-// Telemetry / 遥测接口（预留，填上 URL 即生效）
+// Telemetry / 遥测接口（预留）
 define('HP_TELEMETRY_URL', ''); 
 
 $time = date('Y-m-d H:i:s');
-$ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
 $ua = $_SERVER['HTTP_USER_AGENT'] ?? 'Unknown';
 $method = $_SERVER['REQUEST_METHOD'];
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 
+// ==========================================
+// 1. 优化：获取真实 IP (穿透 CDN/反向代理)
+// ==========================================
+function get_real_ip() {
+    if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
+        return $_SERVER['HTTP_CF_CONNECTING_IP'];
+    }
+    if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        $ips = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
+        return trim($ips[0]);
+    }
+    return $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+}
+
+$ip = get_real_ip();
 $session_id = substr(md5($ip . $ua), 0, 12);
 
+// 新增：识别扫描器 (实现静默放行)
+$is_scanner = false;
+$scanner_list = ['sqlmap', 'nmap', 'dirsearch', 'nuclei', 'nikto', 'zap', 'burp', 'awvs', 'masscan', 'xray', 'goby', 'w3af'];
+foreach ($scanner_list as $s) {
+    if (stripos($ua, $s) !== false) {
+        $is_scanner = true;
+        break;
+    }
+}
+
 // ==========================================
-// 1. Data Storage / 数据存储与安全（Web根目录外隔离）
+// 2. Data Storage / 数据存储与安全
 // ==========================================
 $base_dir = dirname(__DIR__);
 $hidden_dir = $base_dir . '/.hp_' . substr(md5(__DIR__), 0, 8);
@@ -31,21 +55,40 @@ if (!is_dir($hidden_dir)) {
 }
 
 $ban_file = $hidden_dir . '/bans.json';
+$waf_file = $hidden_dir . '/waf_hits.json'; // 新增：WAF记仇文件
 $log_dir  = $hidden_dir;
 
 // ==========================================
-// 2. Core Functions / 核心工具函数
+// 3. Core Functions / 核心工具函数
 // ==========================================
 function post_str(string $key, string $default = ''): string {
     $v = $_POST[$key] ?? $default;
-    return is_string($v) ? $v : $default; // 防 PHP 8 TypeError
+    return is_string($v) ? $v : $default; 
 }
 
 function write_log($msg) {
     global $log_dir, $ip, $ua, $session_id;
     $time = date('Y-m-d H:i:s');
     $log_file = $log_dir . '/access_' . date('Ymd') . '.log';
-    if (file_exists($log_file) && filesize($log_file) > 50 * 1024 * 1024) return; // 50MB 截断保护
+    
+    // 优化：日志轮转机制 (Log Rotation)
+    $max_size = 10 * 1024 * 1024; // 10MB 截断（方便测试）
+    
+    if (file_exists($log_file) && filesize($log_file) > $max_size) {
+        $backup_file = $log_dir . '/access_' . date('Ymd_His') . '.bak.log';
+        @rename($log_file, $backup_file);
+        
+        // 自动清理旧的备份
+        $backup_files = glob($log_dir . '/access_*.bak.log');
+        if (count($backup_files) > 5) {
+            array_multisort(array_map('filemtime', $backup_files), SORT_ASC, $backup_files);
+            $files_to_delete = array_slice($backup_files, 0, count($backup_files) - 5);
+            foreach ($files_to_delete as $file) {
+                @unlink($file);
+            }
+        }
+    }
+    
     $entry = json_encode(['time'=>$time,'ip'=>$ip,'ua'=>$ua,'sid'=>$session_id,'event'=>$msg], JSON_UNESCAPED_UNICODE);
     @file_put_contents($log_file, $entry . "\n", FILE_APPEND | LOCK_EX);
 }
@@ -79,23 +122,8 @@ function get_json_with_lock(string $file): array {
     return $data;
 }
 
-function send_telemetry() {
-    if (HP_TELEMETRY_URL === '') return;
-    global $hidden_dir;
-    $install_file = $hidden_dir . '/install.json';
-    $data = get_json_with_lock($install_file);
-    if (empty($data['install_id'])) $data = ['install_id' => bin2hex(random_bytes(16)), 'last_ping' => 0];
-    if (time() - $data['last_ping'] > 7 * 86400) {
-        $url = HP_TELEMETRY_URL . '?id=' . $data['install_id'] . '&php=' . PHP_VERSION;
-        @file_get_contents($url, false, stream_context_create(['http' => ['timeout' => 1]]));
-        $data['last_ping'] = time();
-    }
-    update_json_with_lock($install_file, function() use ($data) { return $data; });
-}
-send_telemetry();
-
 // ==========================================
-// 3. Decoy Traps / 诱饵陷阱
+// 4. Decoy Traps / 诱饵陷阱
 // ==========================================
 if (preg_match('#/\.git/(HEAD|config|index)$#i', rtrim($path, '/'), $m)) {
     write_log("TRAP_HIT: $path");
@@ -111,7 +139,7 @@ if (preg_match('#/robots\.txt$#i', rtrim($path, '/'))) {
 }
 
 // ==========================================
-// 4. Ban & Cleanup / 封禁拦截与惰性清理
+// 5. Ban & Cleanup / 封禁拦截与清理
 // ==========================================
 $wants_json = strpos($_SERVER['HTTP_ACCEPT'] ?? '', 'application/json') !== false;
 $bans = get_json_with_lock($ban_file);
@@ -149,8 +177,6 @@ if (isset($bans[$ip]) && $bans[$ip]['status'] === 'banned') {
             die(json_encode(['status' => 'banned', 'count' => $new_count]));
         }
         $safe_ip = htmlspecialchars($ip, ENT_QUOTES, 'UTF-8');
-        
-        // Enterprise-style 403 / 企业级风控 403
         if ($new_count >= 2) {
             die("<html><body style='font-family:sans-serif;background:#f4f4f4;color:#333;text-align:center;padding-top:100px;'>
                 <h1 style='font-size:60px;color:#cc0000;margin-bottom:10px;'>403</h1>
@@ -169,20 +195,18 @@ if (isset($bans[$ip]) && $bans[$ip]['status'] === 'banned') {
 }
 
 // ==========================================
-// 5. API Routing / API 路由
+// 6. API Routing / API 路由
 // ==========================================
 if ($method === 'POST') {
     $action = post_str('action');
     header('Content-Type: application/json; charset=utf-8');
 
-    // 数组参数防御（防 PHP 8 TypeError）
     if (!is_string($_POST['user'] ?? '') || !is_string($_POST['pass'] ?? '')) {
         echo json_encode(['status' => 'waf']); exit;
     }
 
     write_log("API: $action | Data: " . json_encode($_POST, JSON_UNESCAPED_UNICODE));
 
-    // 5.1 封禁自身
     if ($action === 'ban_me') {
         update_json_with_lock($ban_file, function($b) use ($ip, $time) {
             $b[$ip] = ['status' => 'banned', 'count' => 0, 'time' => $time, 'expire_at' => time() + (24 * 3600)];
@@ -191,10 +215,8 @@ if ($method === 'POST') {
         echo json_encode(['status' => 'banned']); exit;
     }
 
-    // 防御性延迟
     usleep(min(rand(100000, 500000), 300000));
 
-    // 5.2 命令执行
     if ($action === 'cmd') {
         $cmd = trim(post_str('cmd'));
         $troll_patterns = '/^(whoami|id\b|ls\b|cat\s+\/flag|cat\s+\/etc\/(passwd|shadow)|rm\s+-rf\s+\/|sudo\s+su|pwd|cat\s+\.env|uname\b|ifconfig\b|netstat\b|ps\s+aux|wget\b|curl\b)/i';
@@ -209,13 +231,41 @@ if ($method === 'POST') {
         exit;
     }
 
-    // 5.3 登录
     if ($action === 'login') {
         $user = post_str('user'); $pass = post_str('pass');
-        $waf_patterns = "/(union\s+select|select\s+.*\bfrom\b|sleep\s*\(|benchmark\s*\(|\b(and|or)\s+['\"]?\d+['\"]?\s*=\s*['\"]?\d+)/is";
+        
+        // 融合 SQL注入 和 XSS 特征
+        $waf_patterns = "/(union\s+select|select\s+.*\bfrom\b|sleep\s*\(|benchmark\s*\(|\b(and|or)\s+['\"]?\d+['\"]?\s*=\s*['\"]?\d+|information_schema|<script|javascript:|onerror=|alert\s*\()/is";
+        
         if (preg_match($waf_patterns, $user) || preg_match($waf_patterns, $pass)) {
-            echo json_encode(['status' => 'waf']); exit;
+            
+            // 【扫描器静默绕过】：如果是扫描器，假装账号密码错误，不给警告
+            if ($is_scanner) {
+                echo json_encode(['status' => 'fail', 'msg' => 'Invalid credentials. / 账号或密码错误']);
+                exit;
+            }
+
+            // 【人类记仇机制】：记录该 IP 触发 WAF 的次数
+            $hits = get_json_with_lock($waf_file);
+            $hit_count = ($hits[$ip] ?? 0) + 1;
+            $hits[$ip] = $hit_count;
+            update_json_with_lock($waf_file, function() use ($hits) { return $hits; });
+
+            // 连续两次触发，直接封禁拉黑
+            if ($hit_count >= 2) {
+                update_json_with_lock($ban_file, function($b) use ($ip, $time) {
+                    $b[$ip] = ['status' => 'banned', 'count' => 2, 'time' => $time, 'expire_at' => time() + (24 * 3600)];
+                    return $b;
+                });
+                echo json_encode(['status' => 'troll']); 
+                exit;
+            }
+            
+            // 第一次触发，仅警告
+            echo json_encode(['status' => 'waf']); 
+            exit;
         }
+        
         if (strpos($user, "'") !== false || strpos($user, '"') !== false) {
             echo json_encode(['status' => 'sqlerror', 'msg' => substr($user, 0, 15)], JSON_UNESCAPED_UNICODE); exit;
         }
@@ -227,7 +277,6 @@ if ($method === 'POST') {
         exit;
     }
 
-    // 5.4 文件读取
     if ($action === 'readFile') {
         $file = post_str('file');
         if (preg_match('#(\.\.|php://|data://|expect://|file://|phar://|zip://|gopher://|compress\.|/proc/|/etc/passwd|%2e%2e)#i', $file)) {
@@ -248,17 +297,15 @@ if ($method === 'POST') {
         exit;
     }
 
-    // 5.5 注册
     if ($action === 'register') {
         $user = post_str('user'); $pass = post_str('pass');
         if ($user === '') { echo json_encode(['status' => 'fail', 'msg' => 'Username cannot be empty. / 用户名不能为空']); }
         elseif ($pass === '') { echo json_encode(['status' => 'fail', 'msg' => 'Password cannot be empty. / 密码不能为空']); }
         elseif ($user === 'sysadmin') { echo json_encode(['status' => 'fail', 'msg' => 'Username already exists. / 用户名已存在']); }
-        else { echo json_encode(['status' => 'success', 'msg' => 'Registration successful! Wait for admin approval. / 注册成功！请等待管理员审核。']); }
+        else { echo json_encode(['status' => 'success', 'msg' => 'Registration successful! / 注册成功！']); }
         exit;
     }
 
-    // 5.6 兜底：未知 action
     echo json_encode(['status' => 'error', 'msg' => 'Unknown action. / 未知操作']);
     exit;
 }
@@ -268,7 +315,6 @@ if ($method === 'POST') {
 <head>
     <meta charset="UTF-8">
     <title>System Admin Panel</title>
-    <!-- The Truman Show: Everything you see is fake. You are the main character. -->
     <style>
         body { font-family: 'Courier New', Courier, monospace; background-color: #0d1117; color: #c9d1d9; margin: 0; display: flex; height: 100vh; overflow: hidden; }
         .sidebar { width: 220px; background: #161b22; border-right: 1px solid #30363d; padding: 20px; }
@@ -344,7 +390,6 @@ if ($method === 'POST') {
         </div>
     </div>
 
-    <!-- 双语版 Steam 风格成就弹窗 -->
     <div id="achievementToast" style="display:none; position:fixed; top:20px; right:-400px; width:350px; background:linear-gradient(135deg, #1e1e1e, #2a2a2a); border: 1px solid #ffd700; border-radius: 8px; padding: 15px; color: #fff; font-family: sans-serif; box-shadow: 0 5px 15px rgba(255,215,0,0.3); transition: right 0.5s ease; z-index: 10000; align-items:center; gap:15px;">
         <div style="font-size:40px;">🏆</div>
         <div style="flex: 1;">
@@ -354,7 +399,6 @@ if ($method === 'POST') {
         </div>
     </div>
 
-    <!-- 终极嘲讽与法治警告层（已添加滚动条支持） -->
     <div id="trollModal" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(13, 17, 23, 0.98); z-index:9999; justify-content:center; align-items:center; flex-direction:column; font-family:'Courier New', monospace; color:#00ff00; text-align:center; padding: 40px 20px; box-sizing:border-box; overflow-y: auto;">
         
         <h1 style="font-size: 42px; color: #ff3333; text-shadow: 0 0 15px rgba(255,51,51,0.8); margin-bottom: 20px; font-family: sans-serif; font-weight: bold; margin-top: 20px;">
@@ -372,7 +416,6 @@ if ($method === 'POST') {
             <span style="font-size: 14px; color: #8b949e;">Your payloads, IP, browser fingerprint, and that smug look on your face have been fully logged.</span>
         </p>
 
-        <!-- 楚门的世界 专属文案 -->
         <p style="font-size: 15px; color: #58a6ff; max-width: 800px; line-height: 1.8; margin-bottom: 20px; font-style: italic;">
             "Good morning, and in case I don't see ya, good afternoon, good evening, and good night!"<br>
             <span style="color: #8b949e; font-size: 13px;">你以为你在攻击真实世界，但这只是一场为你独家播出的真人秀。屏幕外有上千个蓝队大佬看着你。</span>
@@ -395,7 +438,6 @@ if ($method === 'POST') {
         </p>
     </div>
 
-    <!-- 帮凶认证层 -->
     <div id="accompliceModal" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.95); z-index: 10002; justify-content:center; align-items:center; flex-direction:column; font-family:'Courier New', monospace; color:#00ff00; padding:20px; box-sizing:border-box;">
         <div id="accompliceText" style="font-size: 24px; text-align: left; min-height: 150px; line-height: 1.5; text-shadow: 0 0 10px #00ff00;" class="cursor"></div>
     </div>
@@ -568,10 +610,17 @@ if ($method === 'POST') {
             fetch('', { method: 'POST', body: fd, headers: { 'Accept': 'application/json' } })
             .then(r => r.json()).then(res => {
                 if (res.status === 'waf') {
-                    div.innerHTML = "<div style='background:#ffe6e6; color:#cc0000; padding:15px;'>[WAF] Access Denied. / 您的请求包含恶意特征，已被系统拦截。</div>";
+                    div.innerHTML = "<div style='background:#ffe6e6; color:#cc0000; padding:15px;'>[WAF] Access Denied. / 警告：检测到恶意特征，请立即停止！</div>";
                     showAchievement(
                         "单引号爱好者 <span style='color:#ffd700;font-size:12px;'>(Quote Lover)</span>", 
                         "你以为你能闭合数据库，其实你只是闭合了智商。<br><span style='color:#888;'>You thought you closed the database, but only your IQ.</span>"
+                    );
+                } else if (res.status === 'troll') {
+                    div.innerHTML = "<div style='background:#ffe6e6; color:#cc0000; padding:15px;'>[WAF] IP Banned. / 连续注入，IP 已被永久拉黑！</div>";
+                    showAchievement(
+                        "头铁玩家 <span style='color:#ffd700;font-size:12px;'>(Hardcore Skid)</span>", 
+                        "事不过三，连续两次触发 WAF，直接封禁。<br><span style='color:#888;'>Banned for hitting WAF twice.</span>", 
+                        () => setTimeout(showTrollModal, 1000)
                     );
                 } else if (res.status === 'sqlerror') {
                     div.innerHTML = "<div style='background:#f9f2f4; color:#d9534f; padding:15px;'>Database Error near '" + escapeHTML(res.msg) + "'</div>";
