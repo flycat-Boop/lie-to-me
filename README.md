@@ -91,5 +91,5 @@ Release v1.2 - Deception & Defense Upgrade
 
 🌟 Acknowledgments / 特别致谢
 
-· Special thanks to @盗号的全家si了 for the sharp Code Review, pointing out the CDN shared IP issue and the 50MB log truncation vulnerability. Your feedback made this project much stronger. (特别感谢群友 盗号的全家si了 的硬核 Code Review，精准指出了 CDN 回源 IP 和日志截断问题，让本项目更加完善。)
+ · Special thanks to @盗号的全家si了 and @天天不醒 for the sharp Code Review, pointing out the CDN shared IP issue, the 50MB log truncation vulnerability, and **proposing the infinite file download feature to burn attackers' bandwidth**. Your feedback made this project much stronger.(特别感谢群友 盗号的全家si了 和@天天不醒的硬核 Code Review，精准指出了 CDN 回源 IP 和日志截断问题，以及对新增功能的提议让本项目更加完善。)
 · Thanks to all allies and developers who provided suggestions for this project. The best defense is built by the community. (感谢所有提出宝贵修改建议的同盟和大佬。最好的防御，由社区共同构建。)
