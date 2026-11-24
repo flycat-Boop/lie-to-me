@@ -2,10 +2,12 @@
 // ==========================================
 // 0. Basic Setup & Compliance
 // ==========================================
-@ini_set('display_errors', 1); // 如果稳定了，想隐藏报错可以改回 0
+@ini_set('display_errors', 1);
 error_reporting(E_ALL);
 ignore_user_abort(true);
 
+// [FIX 1] 只保留这一处定义，删除后面永远不会执行的 if (!defined(...))
+// 是否信任 Cloudflare / 反向代理头（部署在 CF 或反代后面才开）
 define('TRUST_CF', false);
 define('TRUST_PROXY', false);
 define('TRUSTED_PROXIES', ['127.0.0.1', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']);
@@ -52,10 +54,6 @@ function ip_in_cidr(string $ip, string $cidr): bool {
     return ($ipL & $mask) === ($netL & $mask);
 }
 
-if (!defined('TRUST_CF')) define('TRUST_CF', true);
-if (!defined('TRUST_PROXY')) define('TRUST_PROXY', true);
-if (!defined('TRUSTED_PROXIES')) define('TRUSTED_PROXIES', ['127.0.0.1', '172.16.0.0/12', '192.168.0.0/16', '10.0.0.0/8']);
-
 function get_real_ip(): string {
     $remote = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
     if (TRUST_CF && !empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
@@ -66,46 +64,43 @@ function get_real_ip(): string {
             '104.24.0.0/14','172.64.0.0/13','131.0.72.0/22',
         ];
         $ok = false;
-        foreach ($cf_ranges as $r) { 
-            if (ip_in_cidr($remote, $r)) { $ok = true; break; } 
+        foreach ($cf_ranges as $r) {
+            if (ip_in_cidr($remote, $r)) { $ok = true; break; }
         }
         if ($ok) {
             $ip = trim($_SERVER['HTTP_CF_CONNECTING_IP']);
             if (filter_var($ip, FILTER_VALIDATE_IP)) return $ip;
         }
-    } 
+    }
     if (TRUST_PROXY && !empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
         $trusted = false;
-        // 先确认直连 IP 是不是我们信任的代理服务器
-        foreach (TRUSTED_PROXIES as $cidr) { 
-            if (ip_in_cidr($remote, $cidr)) { $trusted = true; break; } 
+        foreach (TRUSTED_PROXIES as $cidr) {
+            if (ip_in_cidr($remote, $cidr)) { $trusted = true; break; }
         }
-        
+
         if ($trusted) {
             $chain = array_reverse(array_map('trim', explode(',', $_SERVER['HTTP_X_FORWARDED_FOR'])));
             foreach ($chain as $cand) {
                 if (!filter_var($cand, FILTER_VALIDATE_IP)) continue;
                 $hop_trusted = false;
-                foreach (TRUSTED_PROXIES as $cidr) { 
-                    if (ip_in_cidr($cand, $cidr)) { $hop_trusted = true; break; } 
+                foreach (TRUSTED_PROXIES as $cidr) {
+                    if (ip_in_cidr($cand, $cidr)) { $hop_trusted = true; break; }
                 }
-                // 找到第一个不是受信任代理的 IP，就是真实客户端 IP
                 if (!$hop_trusted) return $cand;
             }
         }
     }
-    if (!empty($_SERVER['HTTP_X_REAL_IP'])) {
+    // [FIX 3] X-Real-IP 也必须在 TRUST_PROXY 开启时才信任，否则客户端可任意伪造
+    if (TRUST_PROXY && !empty($_SERVER['HTTP_X_REAL_IP'])) {
         $ip = trim($_SERVER['HTTP_X_REAL_IP']);
         if (filter_var($ip, FILTER_VALIDATE_IP)) {
             return $ip;
         }
     }
 
-    // 4. 兜底返回
     return filter_var($remote, FILTER_VALIDATE_IP) ? $remote : '0.0.0.0';
 }
 
-// 调用并生成 session_id
 $ip = get_real_ip();
 $ua = $_SERVER['HTTP_USER_AGENT'] ?? 'Unknown';
 $session_id = substr(hash_hmac('sha256', $ip . '|' . $ua, md5(__DIR__)), 0, 12);
@@ -237,7 +232,8 @@ function waf_hit(string $ip, int $window = 3600): int {
         $count = $rec['count'];
         return $hits;
     });
-    return $ok ? $count : 1;
+    // [FIX 5] 文件打开失败时返回 0，语义更清晰（此前返回 1 会虚增一次命中）
+    return $ok ? $count : 0;
 }
 
 // ==========================================
@@ -345,7 +341,6 @@ if ($method === 'POST') {
     }
 
     if ($action === 'cmd') {
-        // 【保留的卡顿逻辑】：模拟真实服务器执行命令的慢响应
         usleep(random_int(100000, 300000));
 
         $cmd = trim(post_str('cmd'));
@@ -368,7 +363,6 @@ if ($method === 'POST') {
     }
 
     if ($action === 'login') {
-        // 【保留的卡顿逻辑】：模拟数据库查询的延迟
         usleep(random_int(100000, 300000));
 
         $user = post_str('user'); $pass = post_str('pass');
@@ -408,6 +402,8 @@ if ($method === 'POST') {
     if ($action === 'readFile') {
         global $fake_db_pass, $fake_aws_key, $fake_api_secret, $fake_cfg_db_pass;
         $file = post_str('file');
+
+        // 路径遍历检测：用原始输入
         if (preg_match('#(\.\.|php://|data://|expect://|file://|phar://|zip://|gopher://|compress\.|/proc/|/etc/|/root/|%2e%2e)#i', $file)) {
             if ($is_scanner) {
                 echo json_encode([
@@ -423,6 +419,12 @@ if ($method === 'POST') {
             echo json_encode(['status' => 'php_error', 'msg' => "PHP Warning:  include($file): failed to open stream: Permission denied in /var/www/html/index.php on line 42"]);
             exit;
         }
+
+        // [FIX 6] 规范化前导 ./，让 ./.env、./config.php 也能命中
+        if (preg_match('#^\./(.+)$#', $file, $mm)) {
+            $file = $mm[1];
+        }
+
         if ($file === '.env') {
             echo json_encode(['status' => 'success', 'msg' => "APP_NAME=Production_Server\nAPP_ENV=production\nDB_PASSWORD={$fake_db_pass}\nAWS_ACCESS_KEY_ID={$fake_aws_key}"]);
         } elseif ($file === 'config.php') {
@@ -439,6 +441,65 @@ if ($method === 'POST') {
         elseif ($pass === '') { echo json_encode(['status' => 'fail', 'msg' => 'Password cannot be empty. / 密码不能为空']); }
         elseif ($user === 'sysadmin') { echo json_encode(['status' => 'fail', 'msg' => 'Username already exists. / 用户名已存在']); }
         else { echo json_encode(['status' => 'success', 'msg' => 'Registration successful! / 注册成功！']); }
+        exit;
+    }
+
+    if ($action === 'download') {
+        $download_log_file = $hidden_dir . '/downloads.json';
+        update_json_with_lock($download_log_file, function($data) use ($ip, $ua, $time) {
+            if (!isset($data[$ip])) {
+                $data[$ip] = ['first_time' => $time, 'ua' => $ua, 'count' => 0];
+            }
+            $data[$ip]['last_time'] = $time;
+            $data[$ip]['count'] = ($data[$ip]['count'] ?? 0) + 1;
+            return $data;
+        });
+
+        write_log("API: download | Infinite encrypted file download triggered");
+
+        $fake_files = [
+            '财务报表_2024Q3.xlsx',
+            '客户名单_完整版.csv',
+            '员工工资表_10月.xlsx',
+            '数据库备份_20241015.sql',
+            '合同扫描件_重要.zip',
+            '内部通讯录.xlsx',
+            '项目预算表.xlsx',
+            '供应商信息.csv',
+            '销售数据_2024.xlsx',
+            '系统配置文件.zip'
+        ];
+        $fake_filename = $fake_files[mt_rand(0, count($fake_files) - 1)];
+
+        // [FIX 4] 中文文件名用 filename*=UTF-8'' 编码，避免浏览器乱码
+        header('Content-Type: application/octet-stream');
+        $encoded_name = rawurlencode($fake_filename);
+        header("Content-Disposition: attachment; filename=\"download.bin\"; filename*=UTF-8''{$encoded_name}");
+        header('Cache-Control: no-cache, no-store, must-revalidate');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+
+        // [FIX 2] 加最大输出限制 + 用 random_bytes 替代逐字节 mt_rand
+        $max_bytes  = 50 * 1024 * 1024; // 最多 50MB
+        $chunk_size = 8192;
+        $sent       = 0;
+
+        while ($sent < $max_bytes) {
+            $chunk = random_bytes($chunk_size);
+            echo $chunk;
+            $sent += $chunk_size;
+
+            if (ob_get_level()) {
+                ob_flush();
+            }
+            flush();
+
+            if (connection_aborted()) {
+                break;
+            }
+
+            usleep(10000);
+        }
         exit;
     }
 
@@ -472,7 +533,8 @@ function fake_cmd_output(string $cmd): string {
     if (preg_match('/^(netstat|ss)(\s|$)/', $lc)) {
         return "Active Internet connections (only servers)\nProto Recv-Q Send-Q Local Address           Foreign Address         State\ntcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN\ntcp        0      0 0.0.0.0:80              0.0.0.0:*               LISTEN\ntcp        0      0 127.0.0.1:3306          0.0.0.0:*               LISTEN";
     }
-    if (preg_match('/^ps(\s+aux)?$/', $lc)) {
+    // [FIX 7] 放宽 ps 正则，支持 ps -ef / ps aux 等
+    if (preg_match('/^ps(\s|$)/', $lc)) {
         return "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\nroot         1  0.0  0.1 167328 11200 ?        Ss   Jan10   0:03 /sbin/init\nwww-data  1234  0.1  0.5 245280 41234 ?        S    Jan10   0:01 php-fpm: pool www\nmysql     5678  0.2  1.2 1234567 98765 ?      Sl   Jan10   1:23 /usr/sbin/mysqld";
     }
     if (preg_match('/^(wget|curl)\b/', $lc)) {
@@ -852,4 +914,4 @@ function fake_cmd_output(string $cmd): string {
         }
     </script>
 </body>
-</html>
+</html>if
